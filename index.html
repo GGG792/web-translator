@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>本地网页翻译器</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .container {
+    width: 100%;
+    max-width: 860px;
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.3);
+    overflow: hidden;
+  }
+  header {
+    padding: 24px 28px;
+    background: #1e1e2e;
+    color: #fff;
+  }
+  header h1 { font-size: 22px; font-weight: 600; }
+  header p { font-size: 13px; color: #a6adc8; margin-top: 6px; }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 28px;
+    border-bottom: 1px solid #eee;
+    flex-wrap: wrap;
+  }
+  select {
+    padding: 8px 12px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 14px;
+    background: #fff;
+    cursor: pointer;
+  }
+  .badge {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #e8f5e9;
+    color: #2e7d32;
+  }
+  .panes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    min-height: 300px;
+  }
+  @media (max-width: 640px) { .panes { grid-template-columns: 1fr; } }
+  .pane { display: flex; flex-direction: column; }
+  .pane:first-child { border-right: 1px solid #eee; }
+  textarea, .output {
+    flex: 1;
+    width: 100%;
+    min-height: 300px;
+    padding: 20px;
+    border: none;
+    outline: none;
+    resize: vertical;
+    font-size: 16px;
+    line-height: 1.7;
+    font-family: inherit;
+  }
+  .output { background: #f8f9fa; white-space: pre-wrap; word-break: break-word; }
+  .output.placeholder { color: #9aa0a6; }
+  .actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 16px 28px;
+    border-top: 1px solid #eee;
+  }
+  button {
+    padding: 10px 28px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #fff;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: opacity .2s;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #status { font-size: 13px; color: #666; flex: 1; }
+  .progress {
+    height: 4px;
+    background: #eee;
+    border-radius: 2px;
+    overflow: hidden;
+    display: none;
+  }
+  .progress > div {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #667eea, #764ba2);
+    transition: width .2s;
+  }
+  footer {
+    padding: 12px 28px;
+    font-size: 12px;
+    color: #999;
+    text-align: center;
+    background: #fafafa;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>本地网页翻译器</h1>
+    <p>100% 浏览器本地推理 · 模型与运行时均托管于本仓库 · 数据不出本机</p>
+  </header>
+  <div class="controls">
+    <select id="direction">
+      <option value="zh-en">中文 → English</option>
+      <option value="en-zh">English → 中文</option>
+    </select>
+    <span class="badge">离线可用 · 隐私安全</span>
+  </div>
+  <div class="progress" id="progressWrap"><div id="progressBar"></div></div>
+  <div class="panes">
+    <div class="pane">
+      <textarea id="input" placeholder="输入要翻译的文本…"></textarea>
+    </div>
+    <div class="pane">
+      <div class="output placeholder" id="output">翻译结果会显示在这里</div>
+    </div>
+  </div>
+  <div class="actions">
+    <button id="btn" disabled>翻译</button>
+    <span id="status">正在加载本地模型…</span>
+  </div>
+  <footer>Powered by Transformers.js + Helsinki-NLP OPUS-MT（量化 ONNX 模型，WebAssembly 推理）</footer>
+</div>
+
+<script type="module">
+import { pipeline, env } from './lib/transformers.min.js';
+
+// 完全本地化：禁止远程下载，仅从本站点加载模型与 WASM 运行时
+env.allowRemoteModels = false;
+env.allowLocalModels = true;
+env.localModelPath = './models/';
+env.backends.onnx.wasm.wasmPaths = './lib/';
+
+const MODELS = {
+  'zh-en': 'Xenova/opus-mt-zh-en',
+  'en-zh': 'Xenova/opus-mt-en-zh',
+};
+
+const btn = document.getElementById('btn');
+const statusEl = document.getElementById('status');
+const inputEl = document.getElementById('input');
+const outputEl = document.getElementById('output');
+const dirEl = document.getElementById('direction');
+const progressWrap = document.getElementById('progressWrap');
+const progressBar = document.getElementById('progressBar');
+
+const translators = {};
+let currentTask = null;
+let cancelled = false;
+
+function setStatus(t) { statusEl.textContent = t; }
+
+async function loadModel(direction) {
+  if (translators[direction]) return translators[direction];
+  const task = (async () => {
+    setStatus('首次加载模型中（约 113MB，之后走浏览器缓存）…');
+    progressWrap.style.display = 'block';
+    const fileProgress = {};
+    const pipe = await pipeline('translation', MODELS[direction], {
+      quantized: true,
+      progress_callback: (p) => {
+        if (p.status === 'progress' && p.file) {
+          fileProgress[p.file] = p.progress || 0;
+          const vals = Object.values(fileProgress);
+          const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+          progressBar.style.width = avg.toFixed(1) + '%';
+          setStatus(`加载模型：${p.file} ${(p.progress || 0).toFixed(0)}%`);
+        }
+      },
+    });
+    progressWrap.style.display = 'none';
+    progressBar.style.width = '0%';
+    return pipe;
+  })();
+  translators[direction] = task;
+  try { await task; } catch (e) { delete translators[direction]; throw e; }
+  return task;
+}
+
+async function ensureReady() {
+  btn.disabled = true;
+  try {
+    await loadModel(dirEl.value);
+    if (!cancelled) setStatus('模型就绪，可以翻译（纯本地运行）');
+    btn.disabled = false;
+  } catch (e) {
+    console.error(e);
+    setStatus('模型加载失败：' + e.message);
+  }
+}
+
+dirEl.addEventListener('change', ensureReady);
+
+btn.addEventListener('click', async () => {
+  const text = inputEl.value.trim();
+  if (!text) return;
+  btn.disabled = true;
+  outputEl.classList.remove('placeholder');
+  outputEl.textContent = '翻译中…';
+  try {
+    const pipe = await loadModel(dirEl.value);
+    const result = await pipe(text);
+    outputEl.textContent = result[0].translation_text;
+    setStatus('完成 · 全程本地计算');
+  } catch (e) {
+    console.error(e);
+    outputEl.textContent = '翻译出错：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+ensureReady();
+</script>
+</body>
+</html>
