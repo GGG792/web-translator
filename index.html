@@ -98,7 +98,6 @@
   .progress {
     height: 4px;
     background: #eee;
-    border-radius: 2px;
     overflow: hidden;
     display: none;
   }
@@ -127,6 +126,10 @@
     <select id="direction">
       <option value="zh-en">中文 → English</option>
       <option value="en-zh">English → 中文</option>
+      <option value="zh-ru">中文 → Русский</option>
+      <option value="ru-zh">Русский → 中文</option>
+      <option value="en-ru">English → Русский</option>
+      <option value="ru-en">Русский → English</option>
     </select>
     <span class="badge">离线可用 · 隐私安全</span>
   </div>
@@ -143,23 +146,10 @@
     <button id="btn" disabled>翻译</button>
     <span id="status">正在加载本地模型…</span>
   </div>
-  <footer>Powered by Transformers.js + Helsinki-NLP OPUS-MT（量化 ONNX 模型，WebAssembly 推理）</footer>
+  <footer>Powered by Transformers.js + Helsinki-NLP OPUS-MT（量化 ONNX，WebAssembly 推理）· 俄↔中经英语中转</footer>
 </div>
 
 <script type="module">
-import { pipeline, env } from './lib/transformers.min.js';
-
-// 完全本地化：禁止远程下载，仅从本站点加载模型与 WASM 运行时
-env.allowRemoteModels = false;
-env.allowLocalModels = true;
-env.localModelPath = './models/';
-env.backends.onnx.wasm.wasmPaths = './lib/';
-
-const MODELS = {
-  'zh-en': 'Xenova/opus-mt-zh-en',
-  'en-zh': 'Xenova/opus-mt-en-zh',
-};
-
 const btn = document.getElementById('btn');
 const statusEl = document.getElementById('status');
 const inputEl = document.getElementById('input');
@@ -168,73 +158,66 @@ const dirEl = document.getElementById('direction');
 const progressWrap = document.getElementById('progressWrap');
 const progressBar = document.getElementById('progressBar');
 
-const translators = {};
-let currentTask = null;
-let cancelled = false;
+// 推理在 Web Worker 中执行，主线程只做 UI，界面不会卡死
+const worker = new Worker('./worker.js', { type: 'module' });
+
+let readyDirection = null;
+let translateId = 0;
+let translating = false;
 
 function setStatus(t) { statusEl.textContent = t; }
 
-async function loadModel(direction) {
-  if (translators[direction]) return translators[direction];
-  const task = (async () => {
-    setStatus('首次加载模型中（约 113MB，之后走浏览器缓存）…');
+function requestLoad() {
+  readyDirection = null;
+  btn.disabled = true;
+  setStatus('加载模型中（首次需下载，之后走浏览器缓存）…');
+  worker.postMessage({ type: 'load', direction: dirEl.value });
+}
+
+worker.onmessage = (e) => {
+  const msg = e.data;
+  if (msg.type === 'progress') {
     progressWrap.style.display = 'block';
-    const fileProgress = {};
-    const pipe = await pipeline('translation', MODELS[direction], {
-      quantized: true,
-      progress_callback: (p) => {
-        if (p.status === 'progress' && p.file) {
-          fileProgress[p.file] = p.progress || 0;
-          const vals = Object.values(fileProgress);
-          const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-          progressBar.style.width = avg.toFixed(1) + '%';
-          setStatus(`加载模型：${p.file} ${(p.progress || 0).toFixed(0)}%`);
-        }
-      },
-    });
+    progressBar.style.width = msg.avg.toFixed(1) + '%';
+    setStatus(`加载模型 ${msg.pair}：${msg.file} ${msg.fileProgress.toFixed(0)}%`);
+  } else if (msg.type === 'ready') {
     progressWrap.style.display = 'none';
     progressBar.style.width = '0%';
-    return pipe;
-  })();
-  translators[direction] = task;
-  try { await task; } catch (e) { delete translators[direction]; throw e; }
-  return task;
-}
-
-async function ensureReady() {
-  btn.disabled = true;
-  try {
-    await loadModel(dirEl.value);
-    if (!cancelled) setStatus('模型就绪，可以翻译（纯本地运行）');
+    readyDirection = msg.direction;
+    setStatus('模型就绪，可以翻译（纯本地运行）');
+    btn.disabled = translating;
+  } else if (msg.type === 'status') {
+    setStatus(msg.text);
+  } else if (msg.type === 'result') {
+    translating = false;
+    outputEl.classList.remove('placeholder');
+    outputEl.textContent = msg.text;
+    setStatus('完成 · 全程本地计算');
     btn.disabled = false;
-  } catch (e) {
-    console.error(e);
-    setStatus('模型加载失败：' + e.message);
+  } else if (msg.type === 'error') {
+    translating = false;
+    progressWrap.style.display = 'none';
+    outputEl.classList.remove('placeholder');
+    outputEl.textContent = '出错：' + msg.message;
+    setStatus('错误：' + msg.message);
+    btn.disabled = false;
   }
-}
+};
 
-dirEl.addEventListener('change', ensureReady);
+dirEl.addEventListener('change', requestLoad);
 
-btn.addEventListener('click', async () => {
+btn.addEventListener('click', () => {
   const text = inputEl.value.trim();
-  if (!text) return;
+  if (!text || translating) return;
+  if (readyDirection !== dirEl.value) { requestLoad(); }
+  translating = true;
   btn.disabled = true;
   outputEl.classList.remove('placeholder');
   outputEl.textContent = '翻译中…';
-  try {
-    const pipe = await loadModel(dirEl.value);
-    const result = await pipe(text);
-    outputEl.textContent = result[0].translation_text;
-    setStatus('完成 · 全程本地计算');
-  } catch (e) {
-    console.error(e);
-    outputEl.textContent = '翻译出错：' + e.message;
-  } finally {
-    btn.disabled = false;
-  }
+  worker.postMessage({ type: 'translate', id: ++translateId, direction: dirEl.value, text });
 });
 
-ensureReady();
+requestLoad();
 </script>
 </body>
 </html>
